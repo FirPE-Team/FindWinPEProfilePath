@@ -70,7 +70,7 @@ if errorlevel 1 (
 
 Requires the Rust MSVC toolchain to be installed; if you need to build the entire architecture, you also need to install the corresponding target.
 
-```` `bat
+```bat
 cargo test
 cargo build --release
 cargo build --release --target i686-pc-windows-msvc
