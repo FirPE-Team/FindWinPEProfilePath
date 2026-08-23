@@ -1,0 +1,28 @@
+[package]
+name = "FindWinPEProfilePath"
+version = "1.0.0"
+edition = "2024"
+
+[build-dependencies]
+embed-resource = "3.0.6"
+thunk-rs = "0.3.5"
+
+# 优化编译体积
+[profile.release]
+opt-level = 'z'
+lto = true
+codegen-units = 1
+panic = 'abort'
+
+[dependencies]
+argh = "0.1.19"
+anyhow = "1.0.102"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_LibraryLoader",
+] }
+windows-registry = "0.6"
