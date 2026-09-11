@@ -2,18 +2,22 @@ mod utils;
 
 use std::{env, process::ExitCode};
 
-use argh::FromArgs;
+use clap::{CommandFactory, Parser, error::ErrorKind};
 use utils::{SearchError, find_marker, validate_relative_path};
 
-#[derive(FromArgs)]
+#[derive(Debug, Parser)]
+#[command(
+    version,
+    about = "Find a file or directory at the root of a WinPE-accessible volume."
+)]
 /// Find a file or directory at the root of a WinPE-accessible volume.
 struct Arguments {
     /// a relative path below a candidate volume root, for example WinPE or WinPE\\Version.txt
-    #[argh(positional)]
+    #[arg(value_name = "relative-path")]
     path: String,
 
     /// print volume classification and recoverable probe errors to stderr
-    #[argh(switch)]
+    #[arg(short, long)]
     verbose: bool,
 }
 
@@ -50,45 +54,29 @@ fn main() -> ExitCode {
 
 /// 解析命令行参数
 fn parse_arguments() -> Result<Arguments, ExitCode> {
+    if env::args_os().len() == 1 {
+        let mut command = Arguments::command();
+        let _ = command.print_help();
+        println!();
+        return Err(ExitCode::SUCCESS);
+    }
     let verbose_requested = env::args_os().any(|argument| argument == "--verbose");
-    let arguments: Vec<String> = match env::args_os()
-        .map(|argument| argument.into_string())
-        .collect()
-    {
-        Ok(arguments) => arguments,
-        Err(argument) => {
-            if verbose_requested {
-                eprintln!("Invalid UTF-8 argument: {}", argument.to_string_lossy());
-            }
-            return Err(ExitCode::from(2));
-        }
-    };
-    let program_name = arguments
-        .first()
-        .map(String::as_str)
-        .unwrap_or(concat!(env!("CARGO_PKG_NAME"), ".exe"));
-    let values: Vec<&str> = arguments.iter().map(String::as_str).collect();
-    let values = if values.len() == 1 {
-        &["--help"][..]
-    } else {
-        &values[1..]
-    };
-
-    match Arguments::from_args(&[program_name], values) {
+    match Arguments::try_parse_from(env::args_os()) {
         Ok(arguments) => Ok(arguments),
-        Err(early_exit) => match early_exit.status {
-            Ok(()) => {
-                print!("{}", early_exit.output);
-                Err(ExitCode::SUCCESS)
+        Err(error) => {
+            let exit_code = error.exit_code();
+            let output = error.to_string();
+            let use_stderr = verbose_requested
+                && !matches!(
+                    error.kind(),
+                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                );
+            if use_stderr {
+                eprint!("{output}");
+            } else {
+                print!("{output}");
             }
-            Err(()) => {
-                if verbose_requested {
-                    eprint!("{}", early_exit.output);
-                } else {
-                    print!("{}", early_exit.output);
-                }
-                Err(ExitCode::from(2))
-            }
-        },
+            Err(ExitCode::from(exit_code as u8))
+        }
     }
 }
