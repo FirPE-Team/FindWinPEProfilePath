@@ -8,7 +8,7 @@ use utils::{SearchError, find_marker, validate_relative_path};
 #[derive(FromArgs)]
 /// Find a file or directory at the root of a WinPE-accessible volume.
 struct Arguments {
-    /// a relative path below a candidate volume root, for example FirPE or FirPE\\Version.txt
+    /// a relative path below a candidate volume root, for example WinPE or WinPE\\Version.txt
     #[argh(positional)]
     path: String,
 
@@ -68,8 +68,13 @@ fn parse_arguments() -> Result<Arguments, ExitCode> {
         .map(String::as_str)
         .unwrap_or(concat!(env!("CARGO_PKG_NAME"), ".exe"));
     let values: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    let values = if values.len() == 1 {
+        &["--help"][..]
+    } else {
+        &values[1..]
+    };
 
-    match Arguments::from_args(&[program_name], &values[1..]) {
+    match Arguments::from_args(&[program_name], &values) {
         Ok(arguments) => Ok(arguments),
         Err(early_exit) => match early_exit.status {
             Ok(()) => {
