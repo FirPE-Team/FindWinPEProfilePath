@@ -30,16 +30,19 @@ FindWinPEProfilePath.exe --verbose WinPE
 
 程序枚举所有已分配盘符的卷，且每个分类内按盘符升序检查。找到第一个目标后立即结束。
 
-1. 启动分区。
-2. 启动分区所在物理磁盘的其他分区。
-3. USB 磁盘，包括被 Windows 标记为固定磁盘的 USB 硬盘。
-4. 其他可移动介质。
-5. 光盘。
-6. 内置固定硬盘。
-7. RAM 磁盘和虚拟磁盘。
-8. 网络驱动器。
+1. `FirmwareBootDevice` 对应的启动分区。
+2. `FirmwareBootDevice` 所在物理磁盘的其他分区。
+3. Ventoy 数据分区，即已验证包含当前启动 ISO 的分区。
+4. 其他 USB 磁盘，包括被 Windows 标记为固定磁盘的 USB 硬盘。
+5. 其他可移动介质。
+6. 光盘。
+7. 内置固定硬盘。
+8. RAM 磁盘和虚拟磁盘。
+9. 网络驱动器。
 
 > 启动分区通过注册表 `HKLM\SYSTEM\CurrentControlSet\Control\FirmwareBootDevice` 和 `\ArcName` 链接识别。启动分区本身没有盘符时，程序仍会依据物理磁盘号优先检查同盘中已有盘符的其他分区。若无法读取 `FirmwareBootDevice` 或转换 ARC 链接，程序会跳过前两项启动盘优先级，继续检查其余卷。
+
+Ventoy 检测会读取其 UEFI 运行变量，或 ACPI `VTOY`/`iBFT` 表中的运行参数；程序同时校验 Ventoy 磁盘标识、数据分区号及当前 ISO 路径，只有三者一致的已挂载卷才进入第 3 阶段。不会为 Ventoy 盘的其他分区增加额外优先级。
 
 ## 输出与退出码
 

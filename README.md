@@ -30,16 +30,19 @@ FindWinPEProfilePath.exe --verbose WinPE
 
 The program enumerates all volumes with assigned drive letters, checking each category in ascending order of drive letter. The search ends immediately upon finding the first target.
 
-1. Boot partition.
-2. Other partitions on the physical disk containing the boot partition.
-3. USB disks, including USB hard drives marked as fixed disks by Windows.
-4. Other removable media.
-5. Optical discs.
-6. Internal fixed hard drives.
-7. RAM disks and virtual disks.
-8. Network drives.
+1. The boot partition corresponding to `FirmwareBootDevice`.
+2. Other partitions on the physical disk containing `FirmwareBootDevice`.
+3. The Ventoy data partition, verified to contain the ISO currently used for booting.
+4. Other USB disks, including USB hard drives marked as fixed disks by Windows.
+5. Other removable media.
+6. Optical discs.
+7. Internal fixed hard drives.
+8. RAM disks and virtual disks.
+9. Network drives.
 
 > The boot partition is identified through the registry links `HKLM\SYSTEM\CurrentControlSet\Control\FirmwareBootDevice` and `\ArcName`. When the boot partition itself has no drive letter, the program will still prioritize checking other partitions on the same disk that already have drive letters, based on their physical disk numbers. If it cannot read `FirmwareBootDevice` or convert ARC links, the program will skip the first two boot disk priority checks and continue checking the remaining volumes.
+
+Ventoy detection reads its UEFI runtime variables or the runtime parameters in the ACPI `VTOY`/`iBFT` tables. The program also validates the Ventoy disk identifier, data partition number, and current ISO path; only a mounted volume matching all three enters stage 3. No additional priority is given to other partitions on the Ventoy disk.
 
 ## Output and Exit Codes
 

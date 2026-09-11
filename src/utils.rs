@@ -3,11 +3,15 @@ use std::{ffi::c_void, fmt, mem, ptr::null_mut};
 use anyhow::{Context, bail};
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HANDLE, HMODULE},
+        Foundation::{CloseHandle, GENERIC_READ, HANDLE, HMODULE, LUID},
+        Security::{
+            AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
+            SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+        },
         Storage::FileSystem::{
             CreateFileW, FILE_DEVICE_DISK, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ,
             FILE_SHARE_WRITE, GetDriveTypeW, GetFileAttributesW, GetLogicalDrives,
-            INVALID_FILE_ATTRIBUTES, OPEN_EXISTING, QueryDosDeviceW,
+            INVALID_FILE_ATTRIBUTES, OPEN_EXISTING, QueryDosDeviceW, ReadFile,
         },
         System::{
             IO::DeviceIoControl,
@@ -17,6 +21,9 @@ use windows::{
                 STORAGE_PROPERTY_QUERY, StorageAdapterProperty,
             },
             LibraryLoader::{GetModuleHandleW, GetProcAddress},
+            SystemInformation::{FIRMWARE_TABLE_PROVIDER, GetSystemFirmwareTable},
+            Threading::{GetCurrentProcess, OpenProcessToken},
+            WindowsProgramming::GetFirmwareEnvironmentVariableA,
         },
     },
     core::{PCSTR, PCWSTR},
@@ -35,6 +42,18 @@ const DRIVE_FIXED: u32 = 3;
 const DRIVE_REMOTE: u32 = 4;
 const DRIVE_CDROM: u32 = 5;
 const DRIVE_RAMDISK: u32 = 6;
+const VENTOY_OS_PARAM_SIZE: usize = 512;
+const VENTOY_DISK_GUID_OFFSET: usize = 17;
+const VENTOY_PARTITION_ID_OFFSET: usize = 41;
+const VENTOY_IMAGE_PATH_OFFSET: usize = 45;
+const VENTOY_IMAGE_PATH_LENGTH: usize = 384;
+const VENTOY_DISK_GUID_SECTOR_OFFSET: usize = 0x180;
+const VENTOY_MAGIC: [u8; 16] = [
+    0x20, 0x20, 0x77, 0x77, 0x77, 0x2e, 0x76, 0x65, 0x6e, 0x74, 0x6f, 0x79, 0x2e, 0x6e, 0x65, 0x74,
+];
+const VENTOY_VARIABLE_NAME: &[u8] = b"VentoyOsParam\0";
+const VENTOY_VARIABLE_GUID: &[u8] = b"{77772020-2e77-6576-6e74-6f792e6e6574}\0";
+const SYSTEM_ENVIRONMENT_PRIVILEGE: &str = "SeSystemEnvironmentPrivilege";
 
 type NtStatus = i32;
 type NtOpenSymbolicLinkObject = unsafe extern "system" fn(
@@ -78,6 +97,8 @@ enum SearchGroup {
     Boot,
     /// 同一磁盘
     SameDisk,
+    /// Ventoy数据卷
+    Ventoy,
     /// USB卷
     Usb,
     /// 可移动卷
@@ -97,6 +118,7 @@ impl fmt::Display for SearchGroup {
         let name = match self {
             Self::Boot => "boot",
             Self::SameDisk => "same-disk",
+            Self::Ventoy => "ventoy",
             Self::Usb => "usb",
             Self::Removable => "removable",
             Self::Optical => "optical",
@@ -121,6 +143,13 @@ struct Volume {
     device_number: Option<STORAGE_DEVICE_NUMBER>,
     /// 总线类型
     bus_type: Option<i32>,
+}
+
+#[derive(Debug)]
+struct VentoyOsParam {
+    disk_guid: [u8; 16],
+    partition_number: u32,
+    image_path: String,
 }
 
 /// 验证路径是否为相对路径
@@ -199,16 +228,28 @@ pub fn find_marker(relative_path: &str, verbose: bool) -> Result<Option<String>,
         );
     }
 
+    let ventoy_volume = find_ventoy_volume(&volumes, verbose);
+
     let mut candidates: Vec<&Volume> = volumes.iter().collect();
     candidates.sort_by_key(|volume| {
         (
-            classify(volume, boot_nt_path.as_deref(), boot_disk),
+            classify(
+                volume,
+                boot_nt_path.as_deref(),
+                boot_disk,
+                ventoy_volume.map(|volume| volume.root.as_str()),
+            ),
             &volume.root,
         )
     });
 
     for volume in candidates {
-        let group = classify(volume, boot_nt_path.as_deref(), boot_disk);
+        let group = classify(
+            volume,
+            boot_nt_path.as_deref(),
+            boot_disk,
+            ventoy_volume.map(|volume| volume.root.as_str()),
+        );
         let candidate = format!("{}{}", volume.root, relative_path.replace('/', "\\"));
         if verbose {
             eprintln!("[{group}] checking {candidate}");
@@ -232,7 +273,12 @@ pub fn find_marker(relative_path: &str, verbose: bool) -> Result<Option<String>,
 /// # Returns
 ///
 /// * `SearchGroup` - 卷分类
-fn classify(volume: &Volume, boot_nt_path: Option<&str>, boot_disk: Option<u32>) -> SearchGroup {
+fn classify(
+    volume: &Volume,
+    boot_nt_path: Option<&str>,
+    boot_disk: Option<u32>,
+    ventoy_root: Option<&str>,
+) -> SearchGroup {
     if boot_nt_path
         .is_some_and(|path| volume_matches_boot(volume, path, parse_arc_device_number(path)))
     {
@@ -240,6 +286,9 @@ fn classify(volume: &Volume, boot_nt_path: Option<&str>, boot_disk: Option<u32>)
     }
     if boot_disk.is_some() && volume.device_number.map(|number| number.DeviceNumber) == boot_disk {
         return SearchGroup::SameDisk;
+    }
+    if Some(volume.root.as_str()) == ventoy_root {
+        return SearchGroup::Ventoy;
     }
     if volume.bus_type == Some(BUS_TYPE_USB) {
         return SearchGroup::Usb;
@@ -307,6 +356,214 @@ fn enumerate_volumes(verbose: bool) -> anyhow::Result<Vec<Volume>> {
         });
     }
     Ok(volumes)
+}
+
+/// 查找Ventoy卷
+///
+/// # Arguments
+///
+/// * `volumes` - 所有卷信息
+/// * `verbose` - 是否打印详细信息
+///
+/// # Returns
+///
+/// * `volume` - Ventoy卷信息
+fn find_ventoy_volume<'a>(volumes: &'a [Volume], verbose: bool) -> Option<&'a Volume> {
+    let param = match read_ventoy_os_param(verbose) {
+        Some(param) => param,
+        None => return None,
+    };
+
+    let volume = volumes.iter().find(|volume| {
+        let Some(device) = volume.device_number else {
+            return false;
+        };
+        device.PartitionNumber == param.partition_number
+            && physical_disk_ventoy_guid(device.DeviceNumber)
+                .is_ok_and(|guid| guid == param.disk_guid)
+            && path_exists(&format!("{}{}", volume.root, param.image_path))
+    });
+
+    if verbose {
+        match volume {
+            Some(volume) => eprintln!(
+                "Ventoy data volume {} contains the current ISO {}; assigning Ventoy priority.",
+                volume.root, param.image_path
+            ),
+            None => eprintln!(
+                "Warning: Ventoy runtime data was found, but its data volume or ISO {} is not mounted.",
+                param.image_path
+            ),
+        }
+    }
+    volume
+}
+
+/// 读取 Ventoy OS 参数
+///
+/// # Returns
+///
+/// * `param` - Ventoy OS参数
+fn read_ventoy_os_param(verbose: bool) -> Option<VentoyOsParam> {
+    if let Err(error) = enable_system_environment_privilege() {
+        if verbose {
+            eprintln!(
+                "Warning: cannot enable {SYSTEM_ENVIRONMENT_PRIVILEGE} for Ventoy UEFI data: {error}; checking available firmware tables."
+            );
+        }
+    }
+
+    let mut buffer = [0u8; VENTOY_OS_PARAM_SIZE];
+    let size = unsafe {
+        GetFirmwareEnvironmentVariableA(
+            PCSTR(VENTOY_VARIABLE_NAME.as_ptr()),
+            PCSTR(VENTOY_VARIABLE_GUID.as_ptr()),
+            Some(buffer.as_mut_ptr() as *mut c_void),
+            buffer.len() as u32,
+        )
+    };
+    if size as usize == buffer.len() {
+        if let Some(param) = parse_ventoy_os_param(&buffer) {
+            if verbose {
+                eprintln!("Ventoy runtime parameter read from the UEFI variable.");
+            }
+            return Some(param);
+        }
+    }
+
+    for table_id in [u32::from_le_bytes(*b"VTOY"), u32::from_le_bytes(*b"iBFT")] {
+        let provider = FIRMWARE_TABLE_PROVIDER(u32::from_le_bytes(*b"ACPI"));
+        let size = unsafe { GetSystemFirmwareTable(provider, table_id, None) } as usize;
+        if size < VENTOY_OS_PARAM_SIZE {
+            continue;
+        }
+        let mut table = vec![0u8; size];
+        let bytes_read =
+            unsafe { GetSystemFirmwareTable(provider, table_id, Some(&mut table)) } as usize;
+        if bytes_read == 0 || bytes_read > table.len() {
+            continue;
+        }
+        if let Some(param) = table[..bytes_read]
+            .windows(VENTOY_OS_PARAM_SIZE)
+            .find_map(parse_ventoy_os_param)
+        {
+            if verbose {
+                let table_name = if table_id == u32::from_le_bytes(*b"VTOY") {
+                    "VTOY"
+                } else {
+                    "iBFT"
+                };
+                eprintln!("Ventoy runtime parameter read from ACPI {table_name}.");
+            }
+            return Some(param);
+        }
+    }
+    if verbose {
+        eprintln!("Ventoy runtime parameter was not found in UEFI or ACPI data.");
+    }
+    None
+}
+
+/// 启用 SeSystemEnvironmentPrivilege 权限
+fn enable_system_environment_privilege() -> anyhow::Result<()> {
+    let mut token = HANDLE::default();
+    unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+    }
+    .context("cannot open the current process token")?;
+
+    let privilege_name = wide(SYSTEM_ENVIRONMENT_PRIVILEGE);
+    let mut luid = LUID::default();
+    let result = (|| {
+        unsafe { LookupPrivilegeValueW(None, PCWSTR(privilege_name.as_ptr()), &mut luid) }
+            .context("cannot resolve SeSystemEnvironmentPrivilege")?;
+        let privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        unsafe { AdjustTokenPrivileges(token, false, Some(&privileges), 0, None, None) }
+            .context("cannot enable SeSystemEnvironmentPrivilege")
+    })();
+    let close_result = unsafe { CloseHandle(token) };
+    result?;
+    close_result.context("cannot close the current process token")?;
+    Ok(())
+}
+
+/// 解析 Ventoy OS 参数
+///
+/// # Arguments
+///
+/// * `buffer` - Ventoy OS参数缓冲区
+///
+/// # Returns
+///
+/// * `param` - Ventoy OS参数
+fn parse_ventoy_os_param(buffer: &[u8]) -> Option<VentoyOsParam> {
+    if buffer.len() != VENTOY_OS_PARAM_SIZE
+        || buffer[..VENTOY_MAGIC.len()] != VENTOY_MAGIC
+        || buffer.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)) != 0
+    {
+        return None;
+    }
+
+    let mut disk_guid = [0u8; 16];
+    disk_guid.copy_from_slice(&buffer[VENTOY_DISK_GUID_OFFSET..VENTOY_DISK_GUID_OFFSET + 16]);
+    let partition_number = u16::from_le_bytes(
+        buffer[VENTOY_PARTITION_ID_OFFSET..VENTOY_PARTITION_ID_OFFSET + 2]
+            .try_into()
+            .ok()?,
+    ) as u32;
+    let image_path_bytes =
+        &buffer[VENTOY_IMAGE_PATH_OFFSET..VENTOY_IMAGE_PATH_OFFSET + VENTOY_IMAGE_PATH_LENGTH];
+    let image_path_end = image_path_bytes.iter().position(|byte| *byte == 0)?;
+    let image_path = std::str::from_utf8(&image_path_bytes[..image_path_end])
+        .ok()?
+        .trim_start_matches(['/', '\\'])
+        .replace('/', "\\");
+    if partition_number == 0 || validate_relative_path(&image_path).is_err() {
+        return None;
+    }
+    Some(VentoyOsParam {
+        disk_guid,
+        partition_number,
+        image_path,
+    })
+}
+
+/// 读取物理磁盘的 Ventoy GUID
+///
+/// # Arguments
+///
+/// * `disk_number` - 物理磁盘号
+///
+/// # Returns
+///
+/// * `guid` - 物理磁盘的 Ventoy GUID
+fn physical_disk_ventoy_guid(disk_number: u32) -> anyhow::Result<[u8; 16]> {
+    let handle =
+        open_device_with_access(&format!(r"\\.\PhysicalDrive{disk_number}"), GENERIC_READ.0)?;
+    let mut sector = [0u8; 512];
+    let mut bytes_read = 0;
+    let read_result = unsafe { ReadFile(handle, Some(&mut sector), Some(&mut bytes_read), None) };
+    let close_result = unsafe { CloseHandle(handle) };
+    read_result.context("cannot read Ventoy disk header")?;
+    close_result.context("cannot close Ventoy disk header handle")?;
+    if bytes_read as usize != sector.len() {
+        bail!("Ventoy disk header is shorter than one sector");
+    }
+    let mut disk_guid = [0u8; 16];
+    disk_guid.copy_from_slice(
+        &sector[VENTOY_DISK_GUID_SECTOR_OFFSET..VENTOY_DISK_GUID_SECTOR_OFFSET + 16],
+    );
+    Ok(disk_guid)
 }
 
 /// 检查卷是否匹配引导NT路径或引导设备号
@@ -466,11 +723,26 @@ pub fn storage_bus_type(disk_number: u32) -> anyhow::Result<i32> {
 /// * `Ok(handle)` - 打开成功，返回设备句柄
 /// * `Err(anyhow::Error)` - 打开失败，返回错误信息
 pub fn open_device(path: &str) -> anyhow::Result<HANDLE> {
+    open_device_with_access(path, 0)
+}
+
+/// 以指定访问权限打开设备句柄
+///
+/// # Arguments
+///
+/// * `path` - 设备路径
+/// * `access` - 访问权限
+///
+/// # Returns
+///
+/// * `Ok(handle)` - 打开成功，返回设备句柄
+/// * `Err(anyhow::Error)` - 打开失败，返回错误信息
+fn open_device_with_access(path: &str, access: u32) -> anyhow::Result<HANDLE> {
     let path_wide = wide(path);
     unsafe {
         CreateFileW(
             PCWSTR(path_wide.as_ptr()),
-            0,
+            access,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
@@ -632,16 +904,16 @@ mod tests {
 
     #[test]
     fn validates_only_root_relative_paths() {
-        for path in ["FirPE", "FirPE\\Version.txt", "directory/file"] {
+        for path in ["WinPE", "WinPE\\Version.txt", "directory/file"] {
             assert!(validate_relative_path(path).is_ok());
         }
         for path in [
             "",
-            "\\FirPE",
-            "/FirPE",
-            "C:\\FirPE",
-            "FirPE\\..\\x",
-            "FirPE\\\\x",
+            "\\WinPE",
+            "/WinPE",
+            "C:\\WinPE",
+            "WinPE\\..\\x",
+            "WinPE\\\\x",
             ".",
         ] {
             assert!(validate_relative_path(path).is_err());
@@ -686,7 +958,7 @@ mod tests {
             ),
         ];
         for (volume, expected) in samples {
-            assert_eq!(classify(&volume, Some(boot), Some(1)), expected);
+            assert_eq!(classify(&volume, Some(boot), Some(1), None), expected);
         }
     }
 
@@ -700,7 +972,12 @@ mod tests {
             volume("W:\\", DRIVE_FIXED, Some(1), None, Some(boot)),
         ];
 
-        volumes.sort_by_key(|volume| (classify(volume, Some(boot), Some(1)), volume.root.clone()));
+        volumes.sort_by_key(|volume| {
+            (
+                classify(volume, Some(boot), Some(1), None),
+                volume.root.clone(),
+            )
+        });
 
         assert_eq!(
             volumes
@@ -722,5 +999,47 @@ mod tests {
             })
         );
         assert_eq!(parse_arc_device_number(r"\Device\HarddiskVolume3"), None);
+    }
+
+    #[test]
+    fn validates_ventoy_runtime_data() {
+        let mut buffer = [0u8; VENTOY_OS_PARAM_SIZE];
+        buffer[..VENTOY_MAGIC.len()].copy_from_slice(&VENTOY_MAGIC);
+        buffer[VENTOY_DISK_GUID_OFFSET..VENTOY_DISK_GUID_OFFSET + 16].copy_from_slice(&[0xA5; 16]);
+        buffer[VENTOY_PARTITION_ID_OFFSET..VENTOY_PARTITION_ID_OFFSET + 2]
+            .copy_from_slice(&1u16.to_le_bytes());
+        let image_path = b"/ISO/WinPE.iso\0";
+        buffer[VENTOY_IMAGE_PATH_OFFSET..VENTOY_IMAGE_PATH_OFFSET + image_path.len()]
+            .copy_from_slice(image_path);
+        let checksum_index = VENTOY_OS_PARAM_SIZE - 1;
+        buffer[checksum_index] = 0u8.wrapping_sub(
+            buffer[..checksum_index]
+                .iter()
+                .fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+        );
+
+        let param = parse_ventoy_os_param(&buffer).unwrap();
+        assert_eq!(param.disk_guid, [0xA5; 16]);
+        assert_eq!(param.partition_number, 1);
+        assert_eq!(param.image_path, "ISO\\WinPE.iso");
+
+        buffer[0] ^= 1;
+        assert!(parse_ventoy_os_param(&buffer).is_none());
+    }
+
+    #[test]
+    fn ventoy_data_volume_follows_firmware_disk() {
+        let boot = r"\Device\HarddiskVolume1";
+        let firmware_disk = volume("D:\\", DRIVE_FIXED, Some(1), None, None);
+        let ventoy_volume = volume("F:\\", DRIVE_REMOVABLE, Some(2), Some(BUS_TYPE_USB), None);
+
+        assert_eq!(
+            classify(&firmware_disk, Some(boot), Some(1), Some("F:\\")),
+            SearchGroup::SameDisk
+        );
+        assert_eq!(
+            classify(&ventoy_volume, Some(boot), Some(1), Some("F:\\")),
+            SearchGroup::Ventoy
+        );
     }
 }
