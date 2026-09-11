@@ -9,7 +9,9 @@ use std::{
 use anyhow::{Context, bail};
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, GENERIC_READ, HANDLE, HMODULE, LUID},
+        Foundation::{
+            CloseHandle, ERROR_NOT_ALL_ASSIGNED, GENERIC_READ, GetLastError, HANDLE, HMODULE, LUID,
+        },
         Security::{
             AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
             SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
@@ -512,7 +514,11 @@ fn enable_system_environment_privilege() -> anyhow::Result<()> {
             }],
         };
         unsafe { AdjustTokenPrivileges(token, false, Some(&privileges), 0, None, None) }
-            .context("cannot enable SeSystemEnvironmentPrivilege")
+            .context("cannot enable SeSystemEnvironmentPrivilege")?;
+        if unsafe { GetLastError() } == ERROR_NOT_ALL_ASSIGNED {
+            bail!("SeSystemEnvironmentPrivilege is not assigned to the current token");
+        }
+        Ok(())
     })();
     let close_result = unsafe { CloseHandle(token) };
     result?;
