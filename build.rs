@@ -1,7 +1,10 @@
 fn main() {
-    embed_resource::compile("resource/resource.rc", embed_resource::NONE)
-        .manifest_required()
-        .unwrap();
-    println!("cargo:rerun-if-changed=resource/resource.rc");
-    println!("cargo:rerun-if-changed=resource/FindWinPEProfilePath.exe.manifest");
+    // 版本信息
+    embed_resource::compile("./resource/resource.rc", embed_resource::NONE)
+        .manifest_optional()
+        .expect("Add resource error");
+
+    // 兼容 Windows 7、Windows XP
+    #[cfg(not(debug_assertions))]
+    thunk::thunk();
 }
