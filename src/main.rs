@@ -1,19 +1,11 @@
 mod utils;
 
-use std::{env, process::ExitCode};
+use std::{env, ffi::OsString, process::ExitCode};
 
-use argh::FromArgs;
-use utils::{SearchError, find_marker, validate_relative_path};
+use utils::{SearchError, find_marker, validate_relative_path_os};
 
-#[derive(FromArgs)]
-/// Find a file or directory at the root of a WinPE-accessible volume.
 struct Arguments {
-    /// a relative path below a candidate volume root, for example WinPE or WinPE\\Version.txt
-    #[argh(positional)]
-    path: String,
-
-    /// print volume classification and recoverable probe errors to stderr
-    #[argh(switch)]
+    path: OsString,
     verbose: bool,
 }
 
@@ -25,7 +17,7 @@ fn main() -> ExitCode {
     };
 
     // 验证路径是否为相对路径
-    if let Err(error) = validate_relative_path(&arguments.path) {
+    if let Err(error) = validate_relative_path_os(&arguments.path) {
         if arguments.verbose {
             eprintln!("Invalid path: {error}");
         }
@@ -50,45 +42,59 @@ fn main() -> ExitCode {
 
 /// 解析命令行参数
 fn parse_arguments() -> Result<Arguments, ExitCode> {
-    let verbose_requested = env::args_os().any(|argument| argument == "--verbose");
-    let arguments: Vec<String> = match env::args_os()
-        .map(|argument| argument.into_string())
-        .collect()
-    {
-        Ok(arguments) => arguments,
-        Err(argument) => {
-            if verbose_requested {
-                eprintln!("Invalid UTF-8 argument: {}", argument.to_string_lossy());
-            }
-            return Err(ExitCode::from(2));
-        }
-    };
+    let arguments: Vec<OsString> = env::args_os().collect();
+    let verbose_requested = arguments.iter().any(|argument| argument == "--verbose");
     let program_name = arguments
         .first()
-        .map(String::as_str)
-        .unwrap_or(concat!(env!("CARGO_PKG_NAME"), ".exe"));
-    let values: Vec<&str> = arguments.iter().map(String::as_str).collect();
-    let values = if values.len() == 1 {
-        &["--help"][..]
-    } else {
-        &values[1..]
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .unwrap_or_else(|| concat!(env!("CARGO_PKG_NAME"), ".exe").to_owned());
+    let usage = || {
+        format!(
+            "Usage: {program_name} [--verbose] <relative-path>\n\nFind a file or directory at the root of a WinPE-accessible volume.\n"
+        )
     };
 
-    match Arguments::from_args(&[program_name], values) {
-        Ok(arguments) => Ok(arguments),
-        Err(early_exit) => match early_exit.status {
-            Ok(()) => {
-                print!("{}", early_exit.output);
-                Err(ExitCode::SUCCESS)
+    let mut path = None;
+    let mut end_of_options = false;
+    for argument in arguments.into_iter().skip(1) {
+        if !end_of_options && argument == "--" {
+            end_of_options = true;
+        } else if !end_of_options && argument == "--verbose" {
+            continue;
+        } else if !end_of_options && (argument == "--help" || argument == "-h") {
+            print!("{}", usage());
+            return Err(ExitCode::SUCCESS);
+        } else if !end_of_options && argument.to_string_lossy().starts_with('-') {
+            let message = format!(
+                "{}: unrecognized option\n{}",
+                argument.to_string_lossy(),
+                usage()
+            );
+            if verbose_requested {
+                eprint!("{message}");
+            } else {
+                print!("{message}");
             }
-            Err(()) => {
-                if verbose_requested {
-                    eprint!("{}", early_exit.output);
-                } else {
-                    print!("{}", early_exit.output);
-                }
-                Err(ExitCode::from(2))
+            return Err(ExitCode::from(2));
+        } else if path.is_some() {
+            let message = format!("too many positional arguments\n{}", usage());
+            if verbose_requested {
+                eprint!("{message}");
+            } else {
+                print!("{message}");
             }
-        },
+            return Err(ExitCode::from(2));
+        } else {
+            path = Some(argument);
+        }
     }
+
+    let Some(path) = path else {
+        print!("{}", usage());
+        return Err(ExitCode::SUCCESS);
+    };
+    Ok(Arguments {
+        path,
+        verbose: verbose_requested,
+    })
 }

@@ -1,4 +1,10 @@
-use std::{ffi::c_void, fmt, mem, ptr::null_mut};
+use std::{
+    ffi::{OsStr, c_void},
+    fmt, mem,
+    os::windows::ffi::OsStrExt,
+    path::PathBuf,
+    ptr::null_mut,
+};
 
 use anyhow::{Context, bail};
 use windows::{
@@ -175,6 +181,26 @@ pub fn validate_relative_path(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Validate a Windows path without requiring it to be representable as UTF-8.
+pub fn validate_relative_path_os(path: &OsStr) -> anyhow::Result<()> {
+    let units: Vec<u16> = path.encode_wide().collect();
+    if units.is_empty() || units[0] == b'\\' as u16 || units[0] == b'/' as u16 {
+        bail!("path must be relative to a volume root");
+    }
+    if units.iter().any(|unit| *unit == 0 || *unit == b':' as u16) {
+        bail!("path must be relative to a volume root");
+    }
+    for component in units.split(|unit| *unit == b'\\' as u16 || *unit == b'/' as u16) {
+        if component.is_empty()
+            || component == [b'.' as u16]
+            || component == [b'.' as u16, b'.' as u16]
+        {
+            bail!("path must not contain empty, '.' or '..' components");
+        }
+    }
+    Ok(())
+}
+
 /// 查找文件或目录
 ///
 /// # Arguments
@@ -187,7 +213,7 @@ pub fn validate_relative_path(path: &str) -> anyhow::Result<()> {
 /// * `Ok(Some(path))` - 找到文件或目录，返回路径
 /// * `Ok(None)` - 未找到文件或目录
 /// * `Err(SearchError)` - 搜索失败，返回错误信息
-pub fn find_marker(relative_path: &str, verbose: bool) -> Result<Option<String>, SearchError> {
+pub fn find_marker(relative_path: &OsStr, verbose: bool) -> Result<Option<String>, SearchError> {
     let boot_nt_path = match read_firmware_boot_device() {
         Ok(boot_device) => match query_arc_link(&format!(r"\ArcName\{boot_device}")) {
             Ok(path) => Some(path),
@@ -250,12 +276,12 @@ pub fn find_marker(relative_path: &str, verbose: bool) -> Result<Option<String>,
             boot_disk,
             ventoy_volume.map(|volume| volume.root.as_str()),
         );
-        let candidate = format!("{}{}", volume.root, relative_path.replace('/', "\\"));
+        let candidate = PathBuf::from(&volume.root).join(relative_path);
         if verbose {
-            eprintln!("[{group}] checking {candidate}");
+            eprintln!("[{group}] checking {}", candidate.display());
         }
-        if path_exists(&candidate) {
-            return Ok(Some(candidate));
+        if path_exists_os(candidate.as_os_str()) {
+            return Ok(Some(candidate.to_string_lossy().into_owned()));
         }
     }
 
@@ -616,7 +642,11 @@ pub fn parse_arc_device_number(path: &str) -> Option<STORAGE_DEVICE_NUMBER> {
 /// * `true` - 路径存在
 /// * `false` - 路径不存在
 pub fn path_exists(path: &str) -> bool {
-    let path_wide = wide(path);
+    path_exists_os(OsStr::new(path))
+}
+
+pub fn path_exists_os(path: &OsStr) -> bool {
+    let path_wide: Vec<u16> = path.encode_wide().chain(Some(0)).collect();
     unsafe { GetFileAttributesW(PCWSTR(path_wide.as_ptr())) != INVALID_FILE_ATTRIBUTES }
 }
 
