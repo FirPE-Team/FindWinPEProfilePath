@@ -74,7 +74,7 @@ fn parse_arguments() -> Result<Arguments, ExitCode> {
         &values[1..]
     };
 
-    match Arguments::from_args(&[program_name], &values) {
+    match Arguments::from_args(&[program_name], values) {
         Ok(arguments) => Ok(arguments),
         Err(early_exit) => match early_exit.status {
             Ok(()) => {

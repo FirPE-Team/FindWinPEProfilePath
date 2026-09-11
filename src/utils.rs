@@ -368,11 +368,8 @@ fn enumerate_volumes(verbose: bool) -> anyhow::Result<Vec<Volume>> {
 /// # Returns
 ///
 /// * `volume` - Ventoy卷信息
-fn find_ventoy_volume<'a>(volumes: &'a [Volume], verbose: bool) -> Option<&'a Volume> {
-    let param = match read_ventoy_os_param(verbose) {
-        Some(param) => param,
-        None => return None,
-    };
+fn find_ventoy_volume(volumes: &[Volume], verbose: bool) -> Option<&Volume> {
+    let param = read_ventoy_os_param(verbose)?;
 
     let volume = volumes.iter().find(|volume| {
         let Some(device) = volume.device_number else {
@@ -405,12 +402,12 @@ fn find_ventoy_volume<'a>(volumes: &'a [Volume], verbose: bool) -> Option<&'a Vo
 ///
 /// * `param` - Ventoy OS参数
 fn read_ventoy_os_param(verbose: bool) -> Option<VentoyOsParam> {
-    if let Err(error) = enable_system_environment_privilege() {
-        if verbose {
-            eprintln!(
-                "Warning: cannot enable {SYSTEM_ENVIRONMENT_PRIVILEGE} for Ventoy UEFI data: {error}; checking available firmware tables."
-            );
-        }
+    if let Err(error) = enable_system_environment_privilege()
+        && verbose
+    {
+        eprintln!(
+            "Warning: cannot enable {SYSTEM_ENVIRONMENT_PRIVILEGE} for Ventoy UEFI data: {error}; checking available firmware tables."
+        );
     }
 
     let mut buffer = [0u8; VENTOY_OS_PARAM_SIZE];
@@ -422,13 +419,13 @@ fn read_ventoy_os_param(verbose: bool) -> Option<VentoyOsParam> {
             buffer.len() as u32,
         )
     };
-    if size as usize == buffer.len() {
-        if let Some(param) = parse_ventoy_os_param(&buffer) {
-            if verbose {
-                eprintln!("Ventoy runtime parameter read from the UEFI variable.");
-            }
-            return Some(param);
+    if size as usize == buffer.len()
+        && let Some(param) = parse_ventoy_os_param(&buffer)
+    {
+        if verbose {
+            eprintln!("Ventoy runtime parameter read from the UEFI variable.");
         }
+        return Some(param);
     }
 
     for table_id in [u32::from_le_bytes(*b"VTOY"), u32::from_le_bytes(*b"iBFT")] {
